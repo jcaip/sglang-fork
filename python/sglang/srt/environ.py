@@ -1406,6 +1406,13 @@ class Envs:
     SGLANG_TRTLLM_MHA_FULL_ATTN_KV_SPLITS = EnvInt(0)
     # Measured with 4 KV heads per rank on one GPU type; re-tune elsewhere.
     SGLANG_TRTLLM_MHA_FULL_ATTN_KV_SPLITS_MIN_BS = EnvInt(12)
+    # Split the KV of each request across at least this many CTAs in the
+    # cutedsl_mla (FlashInfer CuTe DSL) decode, while the split-KV workspace
+    # still fits. FlashInfer picks splits from occupancy only, so at larger
+    # batches it runs one split per request and the longest request sets the
+    # launch time. Not bit-exact (changes the softmax reduction order). 0 keeps
+    # FlashInfer's choice.
+    SGLANG_CUTEDSL_MLA_DECODE_MIN_KV_SPLITS = EnvInt(0)
     # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
     SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
     # Store DeepSeek-V4 SWA KV directly in FlashInfer's 64-token SM120 page
