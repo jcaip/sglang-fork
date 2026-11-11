@@ -9,6 +9,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.fla import chunk_delta_h_scan as seg_scan
 from sglang.kernels.ops.attention.fla.index import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
@@ -16,8 +17,10 @@ from sglang.kernels.ops.attention.fla.index import (
 from sglang.kernels.ops.attention.fla.op import exp, exp2, safe_exp
 from sglang.kernels.ops.attention.fla.utils import (
     autotune_cache_kwargs,
+    is_nvidia,
     is_nvidia_hopper,
 )
+from sglang.srt.environ import envs
 
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
 CHUNK_SIZE = 64
@@ -345,6 +348,33 @@ def chunk_gated_delta_rule_fwd_h(
         assert track_state.dtype == torch.float32, (
             f"track_state must be fp32, got {track_state.dtype}"
         )
+    if (
+        is_nvidia
+        and envs.SGLANG_OPT_KDA_CHUNK_H_SEGMENT_SCAN.get()
+        and seg_scan.segment_scan_eligible(
+            k=k,
+            u=u,
+            g=g,
+            gk=gk,
+            initial_state=initial_state,
+            initial_state_indices=initial_state_indices,
+            save_new_value=save_new_value,
+            cu_seqlens=cu_seqlens,
+            use_exp2=use_exp2,
+            inplace_update=inplace_update,
+            chunk_offsets=chunk_offsets,
+        )
+    ):
+        return _chunk_gated_delta_rule_fwd_h_segment_scan(
+            k=k,
+            w=w,
+            u=u,
+            gk=gk,
+            initial_state=initial_state,
+            initial_state_indices=initial_state_indices,
+            track_state=track_state,
+            track_chunk_idx=track_chunk_idx,
+        )
     B, T, Hg, K, V = *k.shape, u.shape[-1]
     H = u.shape[-2]
     BT = CHUNK_SIZE
@@ -403,4 +433,148 @@ def chunk_gated_delta_rule_fwd_h(
         USE_EXP2=use_exp2,
         TRACK_STATE=track_state is not None,
     )
+    return h, v_new
+
+
+def _chunk_gated_delta_rule_fwd_h_segment_scan(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    gk: torch.Tensor,
+    initial_state: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    track_state: Optional[torch.Tensor],
+    track_chunk_idx: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """chunk_gated_delta_rule_fwd_h for one long sequence, as a segment scan.
+
+    Same outputs and side effects as the sequential path for the inputs
+    `chunk_delta_h_scan.segment_scan_eligible` accepts: h and v_new, the final
+    state written in place to the pool slot (no write for a -1 slot), and the
+    track_state snapshot. See chunk_delta_h_scan.py for the three passes.
+    """
+    _, T, Hg, K = k.shape
+    H, V = u.shape[-2], u.shape[-1]
+    BT = CHUNK_SIZE
+    NT = triton.cdiv(T, BT)
+    seg_chunks, S = seg_scan.segment_scan_plan(T)
+    device = k.device
+
+    # Pass 1: each segment's affine transition [L_s; A_s] (the last segment's
+    # is never needed).
+    transition = torch.empty(
+        max(S - 1, 1), H, V + K, K, device=device, dtype=torch.float32
+    )
+    if S > 1:
+        seg_scan.segment_transition_kernel[
+            (triton.cdiv(V + K, seg_scan.PASS1_BV), (S - 1) * H)
+        ](
+            k,
+            u,
+            w,
+            gk,
+            transition,
+            seg_chunks * BT,
+            H=H,
+            Hg=Hg,
+            K=K,
+            V=V,
+            BT=BT,
+            BV=seg_scan.PASS1_BV,
+            num_warps=4,
+            num_stages=2,
+        )
+
+    # Pass 2: chain the segment entry states from the pool slot.
+    entry = torch.empty(S, H, V, K, device=device, dtype=torch.float32)
+    seg_scan.segment_entry_state_kernel[(triton.cdiv(V, seg_scan.PASS2_BV), H)](
+        initial_state,
+        initial_state_indices,
+        initial_state.stride(0),
+        transition,
+        entry,
+        S,
+        H=H,
+        K=K,
+        V=V,
+        BV=seg_scan.PASS2_BV,
+        KB=seg_scan.PASS2_KB,
+        num_warps=4,
+    )
+
+    # Pass 3: the sequential kernel over the segments as varlen sequences,
+    # starting from `entry`. It writes each segment's final state back into
+    # entry[s] in place, so entry[S - 1] ends as the sequence's final state.
+    seg_bounds = (
+        torch.arange(S + 1, device=device, dtype=torch.int32) * (seg_chunks * BT)
+    ).clamp_max_(T)
+    seg_ids = torch.arange(S, device=device, dtype=torch.int32)
+    h = k.new_empty(1, NT, H, V, K)
+    v_new = torch.empty_like(u)
+    seg_track = seg_track_idx = None
+    if track_state is not None:
+        # Every segment gets the snapshot index relative to its own start; only
+        # the segment holding the chunk matches and writes seg_track[s].
+        seg_track = torch.empty(S, H, V, K, device=device, dtype=torch.float32)
+        seg_track_idx = (
+            track_chunk_idx[:1].to(torch.int32) - seg_ids * seg_chunks
+        ).contiguous()
+
+    def grid(meta):
+        return (triton.cdiv(V, meta["BV"]), S * H)
+
+    chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
+        k=k,
+        v=u,
+        w=w,
+        v_new=v_new,
+        g=None,
+        gk=gk,
+        h=h,
+        initial_state=entry,
+        initial_state_indices=seg_ids,
+        stride_init_state=entry.stride(0),
+        cu_seqlens=seg_bounds,
+        chunk_offsets=seg_bounds // BT,
+        track_state=seg_track,
+        track_chunk_idx=seg_track_idx,
+        stride_track_state=(seg_track.stride(0) if seg_track is not None else 0),
+        T=T,
+        H=H,
+        Hg=Hg,
+        K=K,
+        V=V,
+        BT=BT,
+        USE_G=False,
+        USE_GK=True,
+        USE_INITIAL_STATE=True,
+        INPLACE_UPDATE=True,
+        SAVE_NEW_VALUE=True,
+        IS_VARLEN=True,
+        NT_BUCKET=(0 if seg_chunks <= 32 else (1 if seg_chunks <= 128 else 2)),
+        USE_EXP2=True,
+        TRACK_STATE=seg_track is not None,
+    )
+
+    seg_scan.segment_final_state_writeback_kernel[(V // seg_scan.WRITEBACK_BV, H)](
+        initial_state,
+        initial_state_indices,
+        initial_state.stride(0),
+        entry[S - 1],
+        H=H,
+        K=K,
+        V=V,
+        BV=seg_scan.WRITEBACK_BV,
+        num_warps=4,
+    )
+
+    if track_state is not None:
+        # Like the sequential kernel, an index outside [0, NT) leaves the
+        # caller's buffer untouched.
+        track_idx = track_chunk_idx[:1].to(torch.int64)
+        valid = (track_idx >= 0) & (track_idx < NT)
+        snapshot = seg_track.index_select(0, (track_idx // seg_chunks).clamp(0, S - 1))
+        track_state[:1].copy_(
+            torch.where(valid.view(1, 1, 1, 1), snapshot, track_state[:1])
+        )
     return h, v_new
