@@ -22,6 +22,9 @@ from sglang.kernels.ops.attention.kv_indices import (
     get_num_kv_index_blocks_flashmla,
     get_num_page_per_block_flashmla,
 )
+from sglang.kernels.ops.attention.mla_kv_pack_quantize_fp8 import (
+    mla_kv_pack_quantize_fp8,
+)
 from sglang.kernels.ops.attention.mla_window_indices import mla_window_sparse_indices
 from sglang.kernels.ops.attention.pad import (
     pad_draft_extend_query as pad_draft_extend_query_triton,
@@ -142,6 +145,20 @@ def _quantize_fp8_qkv(q, k, v, layer):
     k_scale = getattr(layer, "k_scale_float", None)
     if k_scale is None:
         k_scale = 1.0
+    v_scale = getattr(layer, "v_scale_float", None)
+    if v_scale is None:
+        v_scale = 1.0
+    # FP8 K/V here come from pack_prefix_chunk_kv, quantized at unit scale; the
+    # scaled path below would requantize already-FP8 values.
+    if (k.dtype == torch.float8_e4m3fn or v.dtype == torch.float8_e4m3fn) and (
+        k_scale != 1.0 or v_scale != 1.0
+    ):
+        raise RuntimeError(
+            "pack_prefix_chunk_kv packed the chunked-prefix K/V to FP8 at unit "
+            f"scale, but the layer has k_scale={k_scale}, v_scale={v_scale}. "
+            "On trtllm_mla, set SGLANG_DISABLE_TRTLLM_MLA_FP8_PREFIX_PACK=1."
+        )
+
     if k_scale != 1.0:
         assert hasattr(layer, "k_scale"), "k_scale is not set"
         k_2d, _ = scaled_fp8_quant(
@@ -151,9 +168,6 @@ def _quantize_fp8_qkv(q, k, v, layer):
     else:
         k = k.to(torch.float8_e4m3fn)
 
-    v_scale = getattr(layer, "v_scale_float", None)
-    if v_scale is None:
-        v_scale = 1.0
     if v_scale != 1.0:
         assert hasattr(layer, "v_scale"), "v_scale is not set"
         v_2d, _ = scaled_fp8_quant(
@@ -164,6 +178,23 @@ def _quantize_fp8_qkv(q, k, v, layer):
         v = v.to(torch.float8_e4m3fn)
 
     return q, k, v, k_scale, v_scale
+
+
+def _pack_prefix_chunk_kv_unquantized(
+    k_nope: torch.Tensor, k_pe: torch.Tensor, v: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The layout forward_mha builds without a pack hook: K = [k_nope | k_pe]
+    in the input dtype with k_pe broadcast over heads, V passed through."""
+    num_tokens, num_heads, qk_nope_head_dim = k_nope.shape
+    qk_rope_head_dim = k_pe.shape[-1]
+    k = torch.empty(
+        (num_tokens, num_heads, qk_nope_head_dim + qk_rope_head_dim),
+        dtype=v.dtype,
+        device=v.device,
+    )
+    k[..., :qk_nope_head_dim] = k_nope
+    k[..., qk_nope_head_dim:] = k_pe if k_pe.dim() == 3 else k_pe.unsqueeze(1)
+    return k, v
 
 
 # cute-dsl needs its own workspace: it overwrites the buffer with split-KV
@@ -356,6 +387,48 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             and self.kv_lora_rank == 512
             and self.qk_rope_head_dim == 64
             and can_use_set_mla_kv_concat_q_fp8()
+        )
+        self._init_pack_prefix_chunk_kv()
+
+    def _init_pack_prefix_chunk_kv(self) -> None:
+        """Expose pack_prefix_chunk_kv only where it packs to FP8.
+
+        Chunked-prefix MHA (forward_mha) packs each re-projected prefix chunk
+        through this hook. Under an FP8 KV cache the ragged prefill casts K/V
+        to FP8 anyway, so the pack writes unit-scale FP8 directly. Gated on a
+        BF16 model, since a pack hook makes forward_mha read the latent as
+        BF16 instead of q.dtype. forward_mha discovers the hook with getattr,
+        so it is hidden when disabled; subclass overrides are left alone.
+        """
+        enabled = (
+            self.data_type == torch.float8_e4m3fn
+            and self.q_data_type == torch.bfloat16
+            and not envs.SGLANG_DISABLE_TRTLLM_MLA_FP8_PREFIX_PACK.get()
+        )
+        if (
+            not enabled
+            and type(self).pack_prefix_chunk_kv is TRTLLMMLABackend.pack_prefix_chunk_kv
+        ):
+            self.pack_prefix_chunk_kv = None
+
+    def pack_prefix_chunk_kv(
+        self,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        v: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pack strided ``k_nope`` + broadcast ``k_pe`` into contiguous FP8 K
+        and quantize strided ``v`` into contiguous FP8 V in one kernel. The
+        cast matches ``.to(torch.float8_e4m3fn)``, so ``_quantize_fp8_qkv``
+        passes the result through unchanged.
+        """
+        metadata = self.forward_prefill_metadata
+        if metadata is not None and metadata.fallback_to_flashinfer_impl:
+            # forward_extend hands this batch to the FlashInfer MLA parent,
+            # which expects K/V in the model dtype.
+            return _pack_prefix_chunk_kv_unquantized(k_nope, k_pe, v)
+        return mla_kv_pack_quantize_fp8(
+            k_nope, k_pe, v, enable_pdl=is_arch_support_pdl()
         )
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:

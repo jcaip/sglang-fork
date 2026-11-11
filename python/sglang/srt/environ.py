@@ -1406,6 +1406,10 @@ class Envs:
     SGLANG_TRTLLM_MHA_FULL_ATTN_KV_SPLITS = EnvInt(0)
     # Measured with 4 KV heads per rank on one GPU type; re-tune elsewhere.
     SGLANG_TRTLLM_MHA_FULL_ATTN_KV_SPLITS_MIN_BS = EnvInt(12)
+    # Kill switch for trtllm_mla packing the MLA chunked-prefix K/V straight to
+    # unit-scale FP8 under an FP8 KV cache (bit-identical to the BF16 pack plus
+    # cast). Needed only for checkpoints with non-unit attention k/v scales.
+    SGLANG_DISABLE_TRTLLM_MLA_FP8_PREFIX_PACK = EnvBool(False)
     # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
     SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
     # Store DeepSeek-V4 SWA KV directly in FlashInfer's 64-token SM120 page
