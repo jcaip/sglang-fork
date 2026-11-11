@@ -17,7 +17,7 @@ module only supplies the cute-dsl kernel call and its decode forward.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
@@ -34,6 +34,7 @@ from sglang.kernels.ops.attention.utils import (
 from sglang.kernels.ops.quantization.fp8_quantize import fp8_quantize
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.trtllm_mla_backend import (
+    _ENABLE_PDL,
     TRTLLMMLABackend,
     TRTLLMMLAMultiStepDraftBackend,
 )
@@ -41,7 +42,7 @@ from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.mem_cache.layout.paged_view import paged_row_view
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_flashinfer_available
+from sglang.srt.utils import is_flashinfer_available, print_info_once
 
 if is_flashinfer_available():
     import flashinfer
@@ -54,6 +55,70 @@ if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
 logger = logging.getLogger(__name__)
+
+# The CuTe DSL MLA decode accepts an explicit split budget in [1, 48]
+# (FlashInfer's static reducer capacity).
+_CUTEDSL_MLA_MAX_KV_SPLITS = 48
+# K rows per split-KV tile of the CuTe DSL MLA decode kernel.
+_CUTEDSL_MLA_K_TILE = 128
+
+
+def floor_cutedsl_mla_decode_kv_splits(
+    *,
+    split_sizer: Callable[..., tuple[int, int]],
+    batch_size: int,
+    num_heads: int,
+    kv_lora_rank: int,
+    num_sms: int,
+    max_seq_len: int,
+    min_kv_splits: int,
+    workspace_bytes: int,
+) -> Optional[int]:
+    """The split-KV count to force on a q_len-1 CuTe DSL MLA decode, or None to
+    keep FlashInfer's choice.
+
+    FlashInfer picks one split count per launch from occupancy only (about
+    ``num_sms // (2 * batch_size)``), so at larger batches every request runs
+    on a single CTA and the longest request sets the whole launch's time. This
+    raises the count to ``min_kv_splits``, or the largest count below it whose
+    split-KV workspace still fits ``workspace_bytes``. It never lowers
+    FlashInfer's choice.
+
+    ``split_sizer`` is FlashInfer's
+    ``(B, q_len, H, kv_lora_rank, max_active_blocks, max_seq_len,
+    num_kv_splits=None) -> (splits, workspace_bytes)``. A count is first
+    normalized to the non-empty K tiles of ``max_seq_len``, as FlashInfer does
+    for its own choice, so no split is empty for the longest request.
+    """
+    try:
+        natural, _ = split_sizer(
+            batch_size, 1, num_heads, kv_lora_rank, num_sms, max_seq_len
+        )
+    except ValueError:
+        return None
+    if natural >= min_kv_splits:
+        return None
+    k_tiles = -(-max_seq_len // _CUTEDSL_MLA_K_TILE)
+    for wanted in range(min(min_kv_splits, _CUTEDSL_MLA_MAX_KV_SPLITS), natural, -1):
+        splits = -(-k_tiles // -(-k_tiles // wanted))
+        if splits <= natural:
+            # The normalized count only shrinks with ``wanted``.
+            return None
+        try:
+            _, workspace_size = split_sizer(
+                batch_size,
+                1,
+                num_heads,
+                kv_lora_rank,
+                num_sms,
+                max_seq_len,
+                num_kv_splits=splits,
+            )
+        except ValueError:
+            continue
+        if workspace_size <= workspace_bytes:
+            return splits
+    return None
 
 
 class CuteDslMLABackend(TRTLLMMLABackend):
@@ -76,6 +141,117 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             kv_indptr_buf,
             q_indptr_decode_buf,
             backend="cute-dsl",
+        )
+        self._decode_min_kv_splits = envs.SGLANG_CUTEDSL_MLA_DECODE_MIN_KV_SPLITS.get()
+        if not 0 <= self._decode_min_kv_splits <= _CUTEDSL_MLA_MAX_KV_SPLITS:
+            raise ValueError(
+                "SGLANG_CUTEDSL_MLA_DECODE_MIN_KV_SPLITS must be in "
+                f"[0, {_CUTEDSL_MLA_MAX_KV_SPLITS}], got {self._decode_min_kv_splits}"
+            )
+        if self._decode_min_kv_splits > 1:
+            self._init_decode_kv_split_floor()
+
+    # ------------------------------------------------------------------
+    # Split-KV floor (SGLANG_CUTEDSL_MLA_DECODE_MIN_KV_SPLITS).
+    # ------------------------------------------------------------------
+    def _init_decode_kv_split_floor(self) -> None:
+        from flashinfer.cute_dsl.attention.monolithic import mla_decode
+
+        self._cutedsl_mla_decode = mla_decode
+        self._device_sm_count = mla_decode.get_num_sm(torch.device(self.device))
+        self._decode_kv_splits_cache: dict[tuple[int, int, int], Optional[int]] = {}
+        print_info_once(
+            f"cutedsl_mla decode: at least {self._decode_min_kv_splits} KV splits "
+            "per request while the split-KV workspace fits."
+        )
+
+    def _decode_kv_split_floor(
+        self, query: torch.Tensor, max_seq_len: int, cp_world: int
+    ) -> Optional[int]:
+        """The split count to force for this decode launch, or None."""
+        if (
+            self._decode_min_kv_splits < 2
+            or query.dim() != 4
+            or query.shape[1] != 1
+            # cute-dsl refuses skip-softmax; keep FlashInfer's error path.
+            or envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get() is not None
+            # A non-DCP call under DCP keeps the base class's refusal checks.
+            or (cp_world <= 1 and get_parallel().dcp_enabled)
+        ):
+            return None
+        batch_size, _, num_heads, _ = query.shape
+        key = (batch_size, num_heads, max_seq_len)
+        if key not in self._decode_kv_splits_cache:
+            self._decode_kv_splits_cache[key] = floor_cutedsl_mla_decode_kv_splits(
+                split_sizer=self._cutedsl_mla_decode._get_split_kv_and_workspace_size,
+                batch_size=batch_size,
+                num_heads=num_heads,
+                kv_lora_rank=self.kv_lora_rank,
+                num_sms=self._device_sm_count,
+                max_seq_len=max_seq_len,
+                min_kv_splits=self._decode_min_kv_splits,
+                workspace_bytes=self.workspace_buffer.numel()
+                * self.workspace_buffer.element_size(),
+            )
+        return self._decode_kv_splits_cache[key]
+
+    def _run_decode_kernel_with_kv_splits(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        max_seq_len: int,
+        layer: RadixAttention,
+        num_kv_splits: int,
+        *,
+        causal_seqs: Optional[torch.Tensor],
+        cp_world: int,
+        cp_rank: int,
+        return_lse: bool,
+    ):
+        """The CuTe DSL decode with an explicit split budget, returning what
+        ``trtllm_batch_decode_with_kv_cache_mla(backend="cute-dsl")`` would:
+        BF16 out, and a flat ``[B * q_len, H]`` natural-log LSE."""
+        enable_dcp = cp_world > 1
+        if enable_dcp:
+            if causal_seqs is None:
+                raise ValueError(
+                    "causal_seqs (global per-request KV lengths) is required for "
+                    "DCP MLA decode."
+                )
+            # DCP requires the rank-local LSE for the merge.
+            return_lse = True
+        lse = None
+        if return_lse:
+            lse = torch.empty(
+                (query.shape[0] * query.shape[1], query.shape[2]),
+                dtype=torch.float32,
+                device=query.device,
+            )
+        return self._cutedsl_mla_decode.cute_dsl_mla_decode(
+            query=query,
+            kv_cache=kv_cache,
+            workspace_buffer=self.workspace_buffer,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            block_tables=block_tables,
+            seq_lens=(
+                seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
+            ),
+            max_seq_len=max_seq_len,
+            softmax_scale=self._compute_decode_bmm1_scale(layer),
+            out_dtype=torch.bfloat16,
+            enable_pdl=None if enable_dcp else _ENABLE_PDL,
+            lse=lse,
+            return_lse=return_lse,
+            enable_dcp=enable_dcp,
+            cp_world=cp_world if enable_dcp else 1,
+            cp_rank=cp_rank if enable_dcp else 0,
+            causal_seqlens_kv_global=(
+                causal_seqs.to(torch.int32) if enable_dcp else None
+            ),
+            num_kv_splits=num_kv_splits,
         )
 
     # ------------------------------------------------------------------
@@ -101,7 +277,27 @@ class CuteDslMLABackend(TRTLLMMLABackend):
         With DCP, ``seq_lens`` are this rank's cyclic-local KV lengths and
         ``causal_seqs`` the global per-request KV lengths; the kernel returns a
         rank-local ``(out, lse)``, the LSE in natural log.
+
+        Under SGLANG_CUTEDSL_MLA_DECODE_MIN_KV_SPLITS a q_len-1 decode whose
+        split count FlashInfer would leave below the floor calls the CuTe DSL
+        kernel directly with an explicit ``num_kv_splits``; the functional
+        ``trtllm_batch_decode_with_kv_cache_mla`` entry point does not take one.
         """
+        num_kv_splits = self._decode_kv_split_floor(query, max_seq_len, cp_world)
+        if num_kv_splits is not None:
+            return self._run_decode_kernel_with_kv_splits(
+                query,
+                kv_cache,
+                block_tables,
+                seq_lens,
+                max_seq_len,
+                layer,
+                num_kv_splits,
+                causal_seqs=causal_seqs,
+                cp_world=cp_world,
+                cp_rank=cp_rank,
+                return_lse=return_lse,
+            )
         if cp_world <= 1:
             return super()._run_decode_kernel(
                 query,
