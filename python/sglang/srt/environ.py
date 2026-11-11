@@ -1869,6 +1869,12 @@ class Envs:
     # still writes. Requires --enable-hierarchical-cache. Off keeps the
     # donated GPU slot and the previous ratio.
     SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT = EnvBool(False)
+    # Opt-in: run the KDA prefill state pass (chunk_gated_delta_rule_fwd_h) of
+    # one long sequence (>= 8K tokens, K=128, per-channel exp2 gate, state pool)
+    # as a parallel segment scan instead of one sequential walk over its 64-token
+    # chunks. Close to the sequential result but not bit-identical (different
+    # product order); other shapes keep the sequential kernel.
+    SGLANG_OPT_KDA_CHUNK_H_SEGMENT_SCAN = EnvBool(False)
 
     # ===================================================================
     # CUDA graphs and execution buffers
